@@ -1,87 +1,75 @@
 const express = require("express");
 const router = express.Router();
-const Razorpay = require("razorpay");
-const crypto = require("crypto");
+const fetch = require("node-fetch");
 const admin = require("../firebase/admin");
 const { sendPackEmail } = require("../services/brevo");
 
-// ─── Razorpay Instance ────────────────────────────────────
-const razorpay = new Razorpay({
-  key_id: process.env.RAZORPAY_KEY_ID,
-  key_secret: process.env.RAZORPAY_KEY_SECRET,
-});
-
-// ─── POST /api/payment/create-order ──────────────────────
-// Frontend se pack ka price aata hai, Razorpay order create hota hai
+// ─── CREATE ORDER (Cashfree) ─────────────────────────────
 router.post("/create-order", async (req, res) => {
   try {
-    const { amount, packId, packTitle, packDevice } = req.body;
+    const { amount, productId, customerEmail } = req.body;
 
-    // Basic validation
-    if (!amount || !packId) {
-      return res.status(400).json({ error: "amount aur packId required hai" });
+    // ✅ Validation
+    if (!amount || !customerEmail) {
+      return res.status(400).json({ error: "amount aur email required hai" });
     }
 
-    const options = {
-      amount: Math.round(amount * 100), // Razorpay paise mein leta hai
-      currency: "INR",
-      receipt: `receipt_${packId}_${Date.now()}`,
-      notes: {
-        pack_id: packId,
-        pack_title: packTitle || "",
-        pack_device: packDevice || "",
+    const orderId = "order_" + Date.now();
+
+    // 🔹 Cashfree API call
+    const response = await fetch("https://api.cashfree.com/pg/orders", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-client-id": process.env.CASHFREE_APP_ID,
+        "x-client-secret": process.env.CASHFREE_SECRET_KEY,
+        "x-api-version": "2022-09-01"
       },
-    };
-
-    const order = await razorpay.orders.create(options);
-
-    res.json({
-      success: true,
-      orderId: order.id,       // Frontend ko yeh return karo
-      amount: order.amount,
-      currency: order.currency,
+      body: JSON.stringify({
+        order_id: orderId,
+        order_amount: amount,
+        order_currency: "INR",
+        customer_details: {
+          customer_id: "user_" + Date.now(),
+          customer_email: customerEmail,
+          customer_phone: "9999999999"
+        }
+      })
     });
+
+    const data = await response.json();
+
+    if (!data.payment_session_id) {
+      return res.status(500).json({ error: "Cashfree session failed" });
+    }
+
+    // ✅ Frontend ko session bhejo
+    res.json({
+      payment_session_id: data.payment_session_id
+    });
+
   } catch (err) {
-    console.error("Create order error:", err);
-    res.status(500).json({ error: "Order create karne mein error aaya" });
+    console.error("Cashfree order error:", err);
+    res.status(500).json({ error: "Order create failed" });
   }
 });
 
-// ─── POST /api/payment/verify ────────────────────────────
-// Payment ke baad Razorpay signature verify karo, tab email bhejo
-router.post("/verify", async (req, res) => {
+
+// ─── OPTIONAL: PAYMENT SUCCESS (future use - webhook/redirect) ─────────
+router.post("/payment-success", async (req, res) => {
   try {
-    const {
-      razorpay_order_id,
-      razorpay_payment_id,
-      razorpay_signature,
-      userId,
-      userEmail,
-      userName,
-      pack,           // { id, title, device, price, features, driveLink }
-    } = req.body;
+    const { userId, userEmail, userName, pack } = req.body;
 
-    // ─── 1. Signature Verify ───────────────────────────────
-    const expectedSignature = crypto
-      .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
-      .update(`${razorpay_order_id}|${razorpay_payment_id}`)
-      .digest("hex");
-
-    if (expectedSignature !== razorpay_signature) {
-      return res.status(400).json({ success: false, error: "Invalid payment signature!" });
-    }
-
-    // ─── 2. Firebase mein order save karo ─────────────────
     const db = admin.firestore();
     const orderId = `ORDER_${Date.now()}_${pack.id}`;
 
-    // User ke purchases array mein pack ID add karo
+    // ✅ Save purchase
     await db.collection("users").doc(userId).set(
       { purchases: admin.firestore.FieldValue.arrayUnion(pack.id) },
       { merge: true }
     );
 
-    // Orders collection mein save karo
+    // ✅ Save order
     await db.collection("orders").doc(orderId).set({
       userId,
       userEmail,
@@ -89,29 +77,27 @@ router.post("/verify", async (req, res) => {
       packId: pack.id,
       packName: `${pack.title} - ${pack.device}`,
       price: pack.price,
-      razorpayOrderId: razorpay_order_id,
-      razorpayPaymentId: razorpay_payment_id,
+      paymentId: "cashfree_" + Date.now(),
       timestamp: new Date().toISOString(),
       status: "completed",
     });
 
-    // ─── 3. Brevo se email bhejo ───────────────────────────
+    // ✅ Send email
     const emailSent = await sendPackEmail(userEmail, userName, pack);
 
     res.json({
       success: true,
-      emailSent,
-      paymentId: razorpay_payment_id,
-      message: emailSent
-        ? "Payment verified! Pack email bhej diya."
-        : "Payment verified! Email thodi der mein aayegi.",
+      emailSent
     });
+
   } catch (err) {
-    console.error("Verify error:", err);
-    res.status(500).json({ success: false, error: "Verification mein error aaya" });
+    console.error("Payment success error:", err);
+    res.status(500).json({ success: false });
   }
 });
-// ─── POST /api/payment/resend ─────────────────────────────
+
+
+// ─── RESEND EMAIL ───────────────────────────────────────
 router.post("/resend", async (req, res) => {
   try {
     const { userEmail, userName, pack } = req.body;
